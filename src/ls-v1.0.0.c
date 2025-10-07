@@ -1,9 +1,20 @@
 /*
- * Programming Assignment 02: lsv1.0.0  (+ -l support + multi-column)
- * Usage examples (CMD):
- *      bin\ls.exe
- *      bin\ls.exe -l
- *      bin\ls.exe -l src  .
+ * Programming Assignment 02: lsv1.5.0
+ * Features:
+ *   -l  : long listing
+ *   -t  : sort by modification time (newest first)
+ *   -S  : sort by size (largest first)
+ *   -r  : reverse order
+ *   -a  : show hidden (include . and .. and dotfiles)
+ * Default sort: by name (A→Z)
+ *
+ * Usage (CMD on Windows):
+ *   bin\ls.exe
+ *   bin\ls.exe -a
+ *   bin\ls.exe -l
+ *   bin\ls.exe -t
+ *   bin\ls.exe -Sr
+ *   bin\ls.exe -latr src
  */
 
 #include <stdio.h>
@@ -26,7 +37,14 @@
 
 extern int errno;
 
-/* -------- permissions string builder -------- */
+/* -------------------- global sort mode -------------------- */
+typedef enum { SORT_NAME = 0, SORT_TIME, SORT_SIZE } sort_mode_t;
+static sort_mode_t g_sort_mode = SORT_NAME;
+static int g_reverse   = 0;   /* 0 = normal, 1 = reverse */
+static int g_long_flag = 0;   /* from -l */
+static int g_all_flag  = 0;   /* from -a : show hidden */
+
+/* -------------------- permissions string -------------------- */
 static void build_perm_string(mode_t m, char out[11]) {
     out[0] = S_ISDIR(m) ? 'd' :
              S_ISLNK(m) ? 'l' :
@@ -47,7 +65,7 @@ static void build_perm_string(mode_t m, char out[11]) {
     out[10] = '\0';
 }
 
-/* -------- long listing (single file) -------- */
+/* -------------------- long listing (single) -------------------- */
 static void print_long_one(const char *fullpath, const char *name) {
     struct stat st;
     if (lstat(fullpath, &st) == -1) {
@@ -75,7 +93,7 @@ static void print_long_one(const char *fullpath, const char *name) {
            name);
 }
 
-/* -------- console width + columns printing -------- */
+/* -------------------- console width + columns -------------------- */
 static int get_console_width(void) {
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     int columns = 80; // default fallback
@@ -110,72 +128,128 @@ static void print_columns(char **names, int count) {
     }
 }
 
-/* -------- directory listing (with -l or columns) -------- */
-static void do_ls(const char *dir, int long_flag) {
-    struct dirent *entry;
-    DIR *dp = opendir(dir);
-    if (dp == NULL) {
-        fprintf(stderr, "Cannot open directory: %s\n", dir);
-        return;
+/* -------------------- entry list + sorting -------------------- */
+typedef struct {
+    char       *name;    /* d_name */
+    struct stat st;      /* lstat(fullpath) */
+} Entry;
+
+static int cmp_name(const void *a, const void *b) {
+    const Entry *x = (const Entry*)a, *y = (const Entry*)b;
+    int r = strcmp(x->name, y->name);
+    return g_reverse ? -r : r;
+}
+static int cmp_time(const void *a, const void *b) {
+    const Entry *x = (const Entry*)a, *y = (const Entry*)b;
+    /* newest first (desc) */
+    if (x->st.st_mtime == y->st.st_mtime) {
+        int r = strcmp(x->name, y->name);
+        return g_reverse ? -r : r;
     }
-
-    char *names[4096];
-    int count = 0;
-
-    errno = 0;
-    while ((entry = readdir(dp)) != NULL) {
-        /* skip hidden like original code */
-        if (entry->d_name[0] == '.')
-            continue;
-
-        if (long_flag) {
-            char full[PATH_MAX];
-            int need_slash = (dir[0] && dir[strlen(dir)-1] == '/') ? 0 : 1;
-            snprintf(full, sizeof(full), "%s%s%s", dir, need_slash ? "/" : "", entry->d_name);
-            print_long_one(full, entry->d_name);
-        } else {
-            /* collect names for multi-column */
-            names[count] = _strdup(entry->d_name);   /* Windows-safe strdup */
-            if (!names[count]) { perror("strdup"); break; }
-            count++;
-            if (count >= (int)(sizeof(names)/sizeof(names[0]))) break;
-        }
+    long diff = (long)(y->st.st_mtime - x->st.st_mtime);
+    int r = (diff > 0) ? 1 : -1;
+    return g_reverse ? -r : r;
+}
+static int cmp_size(const void *a, const void *b) {
+    const Entry *x = (const Entry*)a, *y = (const Entry*)b;
+    /* largest first (desc) */
+    if (x->st.st_size == y->st.st_size) {
+        int r = strcmp(x->name, y->name);
+        return g_reverse ? -r : r;
     }
-    if (errno != 0) perror("readdir failed");
-    closedir(dp);
+    int r = (y->st.st_size > x->st.st_size) ? 1 : -1;
+    return g_reverse ? -r : r;
+}
 
-    if (!long_flag) {
-        print_columns(names, count);
-        for (int i = 0; i < count; i++) free(names[i]);
+static void sort_entries(Entry *arr, int n) {
+    switch (g_sort_mode) {
+        case SORT_TIME: qsort(arr, n, sizeof(Entry), cmp_time); break;
+        case SORT_SIZE: qsort(arr, n, sizeof(Entry), cmp_size); break;
+        case SORT_NAME:
+        default:        qsort(arr, n, sizeof(Entry), cmp_name); break;
     }
 }
 
-int main(int argc, char const *argv[]) {
-    int opt, long_flag = 0;
+/* -------------------- directory listing (sorted) -------------------- */
+static void do_ls(const char *dir) {
+    DIR *dp = opendir(dir);
+    if (!dp) { fprintf(stderr, "Cannot open directory: %s\n", dir); return; }
 
-    /* parse -l */
-    while ((opt = getopt(argc, (char * const *)argv, "l")) != -1) {
-        if (opt == 'l') long_flag = 1;
+    Entry items[4096];
+    int count = 0;
+    errno = 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        /* show hidden only if -a is set; otherwise skip dotfiles */
+        if (!g_all_flag && ent->d_name[0] == '.') continue;
+
+        /* full path */
+        char full[PATH_MAX];
+        int need_slash = (dir[0] && dir[strlen(dir)-1] == '/') ? 0 : 1;
+        snprintf(full, sizeof(full), "%s%s%s", dir, need_slash?"/":"", ent->d_name);
+
+        /* lstat for sorting + long view */
+        if (lstat(full, &items[count].st) == -1) {
+            perror(full);
+            continue;
+        }
+        items[count].name = strdup(ent->d_name);
+        if (!items[count].name) { perror("strdup"); break; }
+
+        count++;
+        if (count >= (int)(sizeof(items)/sizeof(items[0]))) break;
+    }
+    if (errno) perror("readdir failed");
+    closedir(dp);
+
+    /* sort as per flags */
+    sort_entries(items, count);
+
+    if (g_long_flag) {
+        for (int i = 0; i < count; ++i) {
+            char full[PATH_MAX];
+            int need_slash = (dir[0] && dir[strlen(dir)-1] == '/') ? 0 : 1;
+            snprintf(full, sizeof(full), "%s%s%s", dir, need_slash?"/":"", items[i].name);
+            print_long_one(full, items[i].name);
+        }
+    } else {
+        char *names[4096];
+        for (int i = 0; i < count; ++i) names[i] = items[i].name;
+        print_columns(names, count);
+    }
+
+    for (int i = 0; i < count; ++i) free(items[i].name);
+}
+
+/* -------------------- main -------------------- */
+int main(int argc, char *argv[]) {
+    int opt;
+    /* parse: l, t, S, r, a */
+    while ((opt = getopt(argc, argv, "ltSra")) != -1) {
+        switch (opt) {
+            case 'l': g_long_flag = 1;       break;
+            case 't': g_sort_mode = SORT_TIME; break;
+            case 'S': g_sort_mode = SORT_SIZE; break;
+            case 'r': g_reverse   = 1;       break;
+            case 'a': g_all_flag  = 1;       break;
+            default: /* ignore */            break;
+        }
     }
 
     if (optind == argc) {
-        /* no paths → current dir */
-        do_ls(".", long_flag);
+        do_ls(".");
     } else {
-        for (int i = optind; i < argc; i++) {
+        for (int i = optind; i < argc; ++i) {
             struct stat st;
-            if (lstat(argv[i], &st) == -1) {
-                perror(argv[i]);
-                continue;
-            }
+            if (lstat(argv[i], &st) == -1) { perror(argv[i]); continue; }
 
             printf("Directory listing of %s : \n", argv[i]);
-
             if (S_ISDIR(st.st_mode)) {
-                do_ls(argv[i], long_flag);
+                do_ls(argv[i]);
             } else {
-                if (long_flag) print_long_one(argv[i], argv[i]);
-                else           printf("%s\n", argv[i]);
+                if (g_long_flag) print_long_one(argv[i], argv[i]);
+                else             printf("%s\n", argv[i]);
             }
             puts("");
         }
